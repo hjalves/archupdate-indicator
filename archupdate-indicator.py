@@ -12,6 +12,7 @@ import argparse
 import logging
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -37,7 +38,7 @@ class ArchUpdateIndicator:
     log = logging.getLogger("ArchUpdateIndicator")
     title = "Arch Update Indicator"
 
-    def __init__(self, period, terminal, update_cmd, icons_folder, notifications=True):
+    def __init__(self, period, terminal, update_cmd, icons_folder, notifications):
         self.period = period
         self.terminal = terminal
         self.update_cmd = update_cmd
@@ -52,13 +53,15 @@ class ArchUpdateIndicator:
             pystray.MenuItem("Install updates", lambda _: self._install_updates()),
             pystray.MenuItem(
                 "Notifications",
-                self._toggle_notifications,
+                lambda _: self._toggle_notifications(),
                 lambda _: self.notifications,
             ),
-            pystray.MenuItem("Quit", self._stop),
+            pystray.MenuItem("Quit", self._quit),
         )
         self.icon = pystray.Icon(self.title, title=self.title, menu=menu)
         self._set_icon(Icons.NO_UPDATES)
+
+    def mainloop(self):
         self.log.debug(
             "Arch Update Indicator initialized with period: %s seconds", self.period
         )
@@ -67,9 +70,20 @@ class ArchUpdateIndicator:
         )
         self.log.debug("Notifications enabled: %s", self.notifications)
         self.log.debug("Icons folder: %s", self.icons_folder)
-
-    def mainloop(self):
         self.icon.run(setup=self._setup)
+
+    def _setup(self, icon):
+        self.periodic_check_thread = threading.Thread(
+            target=self._periodic_check_handler,
+            name="PeriodicCheckThread",
+            daemon=True,
+        )
+        self.periodic_check_thread.start()
+        icon.visible = True
+        self.log.debug("Setup complete.")
+
+    def _quit(self):
+        self.icon.stop()
 
     def _set_icon(self, icon_path):
         icon_path = self.icons_folder / icon_path
@@ -81,7 +95,7 @@ class ArchUpdateIndicator:
     def _set_title(self, title):
         self.icon.title = title
 
-    def _toggle_notifications(self, item):
+    def _toggle_notifications(self):
         self.notifications = not self.notifications
         self.log.debug("Notifications enabled: %s", self.notifications)
 
@@ -89,16 +103,6 @@ class ArchUpdateIndicator:
         self.log.debug(f"Notify: {message}")
         if self.notifications:
             self.icon.notify(message, self.title)
-
-    def _setup(self, icon):
-        self.periodic_check_thread = threading.Thread(
-            target=self._periodic_check_handler,
-            name="PeriodicCheckThread",
-            daemon=True,
-        )
-        self.periodic_check_thread.start()
-        icon.visible = True
-        self.log.debug("Arch Update Indicator setup complete.")
 
     def _periodic_check_handler(self):
         while True:
@@ -167,9 +171,6 @@ class ArchUpdateIndicator:
         self.log.debug("Process finished with return code: %s", proc.returncode)
         self._check_updates()
 
-    def _stop(self):
-        self.icon.stop()
-
 
 def main():
     parser = argparse.ArgumentParser(description="Arch Update Indicator")
@@ -224,8 +225,8 @@ def main():
 
     icons_folder = Path(args.icons_folder)
     if not icons_folder.exists():
-        logging.error("Icons folder does not exist: %s", icons_folder)
-        return
+        sys.stderr.write(f"Error: Icons folder does not exist: {icons_folder}\n")
+        return 1
 
     indicator = ArchUpdateIndicator(
         period=args.period,
@@ -238,4 +239,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
