@@ -22,8 +22,8 @@ from PIL import Image
 
 HERE = Path(__file__).parent
 
-UPDATE_PERIOD = int(os.getenv("UPDATE_PERIOD", "1800"))
-TERMINAL = os.getenv("TERMINAL", "xfce4-terminal")
+UPDATE_PERIOD = int(os.getenv("UPDATE_PERIOD", "3600"))
+TERMINAL = os.getenv("TERMINAL", "xfce4-terminal --disable-server")
 UPDATE_CMD = os.getenv("UPDATE_CMD", "sudo pacman -Syu")
 ICONS_FOLDER = Path(os.getenv("ICONS_FOLDER", str(HERE / "icons")))
 
@@ -144,11 +144,11 @@ class ArchUpdateIndicator:
             self.updates = updates
         elif proc.returncode == 2:
             # No updates available
-            self.updates = []
             self._set_icon(Icons.NO_UPDATES)
             self._set_title("No updates available")
-            if check_notify:
+            if check_notify or len(self.updates) > 0:
                 self._notify("No updates available.")
+            self.updates = []
         else:
             # Check for updates failed
             self._set_icon(Icons.CHECK_UPDATES_FAILED)
@@ -167,7 +167,7 @@ class ArchUpdateIndicator:
         self.install_updates_thread.start()
 
     def _install_updates_handler(self):
-        proc = subprocess.run([self.terminal, "-e", self.update_cmd], check=False)
+        proc = subprocess.run(self.terminal.split() + ["-e", self.update_cmd], check=False)
         self.log.debug("Process finished with return code: %s", proc.returncode)
         self._check_updates()
 
