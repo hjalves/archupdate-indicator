@@ -6,11 +6,13 @@ context menu to install them.
 Dependencies:
  * pacman-contrib to check for updates
  * python-pystray for the icon and the context menu
+ * optionally an AUR helper (paru or yay) to also check AUR updates
 """
 
 import argparse
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -26,6 +28,48 @@ UPDATE_PERIOD = int(os.getenv("UPDATE_PERIOD", "3600"))
 TERMINAL = os.getenv("TERMINAL", "xfce4-terminal --disable-server")
 UPDATE_CMD = os.getenv("UPDATE_CMD", "sudo pacman -Syu")
 ICONS_FOLDER = Path(os.getenv("ICONS_FOLDER", str(HERE / "icons")))
+AUR_HELPER = os.getenv("AUR_HELPER", "auto")
+
+# Longest package list shown in the menu / notification before truncating.
+MAX_MENU_PACKAGES = 40
+MAX_NOTIFY_PACKAGES = 8
+
+
+def detect_aur_helper(choice):
+    """Return the AUR helper executable to use, or None."""
+    if choice in ("", "none"):
+        return None
+    if choice != "auto":
+        return choice
+    return next((h for h in ("paru", "yay") if shutil.which(h)), None)
+
+
+class Update:
+    """One upgradable package, parsed from a "name old -> new" line."""
+
+    def __init__(self, line, source):
+        self.line = line
+        self.source = source
+        parts = line.split()
+        self.name = parts[0]
+        if len(parts) >= 4 and parts[2] == "->":
+            self.old, self.new = parts[1], parts[3]
+        else:
+            self.old = self.new = None
+        self.ignored = "[ignored]" in parts
+
+    def label(self):
+        text = self.name
+        if self.old:
+            text += f"  {self.old} \u2192 {self.new}"
+        if self.source != "repo":
+            text += f"  [{self.source}]"
+        if self.ignored:
+            text += "  (ignored)"
+        return text
+
+    def key(self):
+        return (self.name, self.new)
 
 
 class Icons:
@@ -38,8 +82,11 @@ class ArchUpdateIndicator:
     log = logging.getLogger("ArchUpdateIndicator")
     title = "Arch Update Indicator"
 
-    def __init__(self, period, terminal, update_cmd, icons_folder, notifications):
+    def __init__(
+        self, period, terminal, update_cmd, icons_folder, notifications, aur_helper
+    ):
         self.period = period
+        self.aur_helper = aur_helper
         self.terminal = terminal
         self.update_cmd = update_cmd
         self.icons_folder = icons_folder
@@ -48,18 +95,43 @@ class ArchUpdateIndicator:
         self.install_updates_thread = None
         self.periodic_check_thread = None
         self.updates = []
-        menu = pystray.Menu(
-            pystray.MenuItem("Check for updates", lambda _: self._check_updates(True)),
-            pystray.MenuItem("Install updates", lambda _: self._install_updates()),
-            pystray.MenuItem(
-                "Notifications",
-                lambda _: self._toggle_notifications(),
-                lambda _: self.notifications,
-            ),
-            pystray.MenuItem("Quit", self._quit),
+        self.status = "Not checked yet"
+        self.last_check = None
+        self.icon = pystray.Icon(
+            self.title, title=self.title, menu=pystray.Menu(self._menu_items)
         )
-        self.icon = pystray.Icon(self.title, title=self.title, menu=menu)
         self._set_icon(Icons.NO_UPDATES)
+
+    def _menu_items(self):
+        """Generate the context menu; re-evaluated by icon.update_menu()."""
+        noop = lambda _: None  # noqa: E731
+        status = self.status
+        if self.last_check:
+            status += f" (checked {time.strftime('%H:%M', self.last_check)})"
+        yield pystray.MenuItem(status, noop, enabled=False)
+        if self.updates:
+            shown = self.updates[:MAX_MENU_PACKAGES]
+            # Enabled (but no-op) so the list isn't rendered greyed out.
+            items = [pystray.MenuItem(u.label(), noop) for u in shown]
+            if hidden := len(self.updates) - len(shown):
+                items.append(
+                    pystray.MenuItem(f"\u2026 and {hidden} more", noop, enabled=False)
+                )
+            yield pystray.MenuItem("Upgradable packages", pystray.Menu(*items))
+        yield pystray.Menu.SEPARATOR
+        yield pystray.MenuItem("Check for updates", lambda _: self._check_updates(True))
+        yield pystray.MenuItem(
+            "Install updates",
+            lambda _: self._install_updates(),
+            enabled=bool(self.updates),
+        )
+        yield pystray.MenuItem(
+            "Notifications",
+            lambda _: self._toggle_notifications(),
+            lambda _: self.notifications,
+        )
+        yield pystray.Menu.SEPARATOR
+        yield pystray.MenuItem("Quit", self._quit)
 
     def mainloop(self):
         self.log.debug(
@@ -69,6 +141,7 @@ class ArchUpdateIndicator:
             "Terminal: %s, Update command: %s", self.terminal, self.update_cmd
         )
         self.log.debug("Notifications enabled: %s", self.notifications)
+        self.log.debug("AUR helper: %s", self.aur_helper)
         self.log.debug("Icons folder: %s", self.icons_folder)
         self.icon.run(setup=self._setup)
 
@@ -92,17 +165,19 @@ class ArchUpdateIndicator:
             return
         self.icon.icon = Image.open(icon_path)
 
-    def _set_title(self, title):
-        self.icon.title = title
+    def _set_status(self, status):
+        self.status = status
+        self.icon.title = status
+        self.icon.update_menu()
 
     def _toggle_notifications(self):
         self.notifications = not self.notifications
         self.log.debug("Notifications enabled: %s", self.notifications)
 
-    def _notify(self, message):
-        self.log.debug(f"Notify: {message}")
+    def _notify(self, message, title=None):
+        self.log.debug("Notify: %s", message)
         if self.notifications:
-            self.icon.notify(message, self.title)
+            self.icon.notify(message, title or self.title)
 
     def _periodic_check_handler(self):
         while True:
@@ -123,38 +198,64 @@ class ArchUpdateIndicator:
         )
         self.update_check_thread.start()
 
+    def _run_check(self, cmd, source, no_updates_rc):
+        """Run a check command. Returns a list of Update, or None on failure.
+
+        no_updates_rc is the exit code meaning "nothing to upgrade"
+        (checkupdates: 2, paru/yay -Qua: 1).
+        """
+        try:
+            proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        except OSError as e:
+            self.log.error("%s failed: %s", cmd[0], e)
+            return None
+        self.log.debug("%s finished with return code: %s", cmd[0], proc.returncode)
+        lines = proc.stdout.strip().splitlines()
+        if proc.returncode == 0 or (proc.returncode == no_updates_rc and not lines):
+            if err := proc.stderr.strip():
+                self.log.warning("%s stderr: %s", cmd[0], err)
+            return [Update(line, source) for line in lines if line.strip()]
+        self.log.error("%s stderr: %s", cmd[0], proc.stderr.strip())
+        return None
+
     def _check_updates_handler(self, check_notify=False):
         self.log.debug("Checking for updates...")
-        proc = subprocess.run(
-            ["checkupdates"], check=False, capture_output=True, text=True
-        )
-        self.log.debug("Process finished with return code: %s", proc.returncode)
+        updates = self._run_check(["checkupdates"], "repo", 2)
+        if updates is not None and self.aur_helper:
+            aur = self._run_check([self.aur_helper, "-Qua"], "AUR", 1)
+            if aur is None:
+                self.log.warning("AUR check failed; showing repo updates only.")
+            else:
+                updates += aur
+        self.last_check = time.localtime()
 
-        if proc.returncode == 0:
-            # Updates available
-            updates = proc.stdout.strip().splitlines()
-            for s in updates:
-                self.log.debug(s)
-            if err := proc.stderr.strip():
-                self.log.warning("checkupdates stderr: %s", err)
-            self._set_icon(Icons.UPDATES_AVAILABLE)
-            self._set_title(f"{len(updates)} updates available")
-            if check_notify or len(updates) != len(self.updates):
-                self._notify(f"{len(updates)} updates available!")
-            self.updates = updates
-        elif proc.returncode == 2:
-            # No updates available
-            self._set_icon(Icons.NO_UPDATES)
-            self._set_title("No updates available")
-            if check_notify or len(self.updates) > 0:
-                self._notify("No updates available.")
-            self.updates = []
-        else:
-            # Check for updates failed
+        if updates is None:
             self._set_icon(Icons.CHECK_UPDATES_FAILED)
-            self._set_title("Failed to check for updates")
+            self._set_status("Failed to check for updates")
             if check_notify:
                 self._notify("Failed to check for updates!")
+            return
+
+        for u in updates:
+            self.log.debug(u.line)
+        changed = {u.key() for u in updates} != {u.key() for u in self.updates}
+        self.updates = updates
+
+        if updates:
+            n = len(updates)
+            summary = f"{n} update{'s' if n != 1 else ''} available"
+            self._set_icon(Icons.UPDATES_AVAILABLE)
+            self._set_status(summary)
+            if check_notify or changed:
+                names = [u.name for u in updates[:MAX_NOTIFY_PACKAGES]]
+                if n > MAX_NOTIFY_PACKAGES:
+                    names.append(f"\u2026 and {n - MAX_NOTIFY_PACKAGES} more")
+                self._notify(", ".join(names), summary)
+        else:
+            self._set_icon(Icons.NO_UPDATES)
+            self._set_status("System is up to date")
+            if check_notify or changed:
+                self._notify("No updates available.")
 
     def _install_updates(self):
         if self.install_updates_thread and self.install_updates_thread.is_alive():
@@ -203,6 +304,14 @@ def main():
         help="Set the folder containing the icon images (default: %(default)s)",
     )
     parser.add_argument(
+        "-a",
+        "--aur-helper",
+        type=str,
+        default=AUR_HELPER,
+        help="AUR helper used to check AUR updates: auto, none, paru, yay... "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
         "-n", "--no-notifications", action="store_true", help="Disable notifications"
     )
     parser.add_argument(
@@ -234,6 +343,7 @@ def main():
         update_cmd=args.command,
         icons_folder=icons_folder,
         notifications=not args.no_notifications,
+        aur_helper=detect_aur_helper(args.aur_helper),
     )
     indicator.mainloop()
 
