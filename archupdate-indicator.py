@@ -12,6 +12,7 @@ Dependencies:
 import argparse
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -26,7 +27,7 @@ HERE = Path(__file__).parent
 
 UPDATE_PERIOD = int(os.getenv("UPDATE_PERIOD", "3600"))
 TERMINAL = os.getenv("TERMINAL", "xfce4-terminal --disable-server")
-UPDATE_CMD = os.getenv("UPDATE_CMD", "sudo pacman -Syu")
+UPDATE_CMD = os.getenv("UPDATE_CMD", "sudo pacman -Syu --noconfirm")
 ICONS_FOLDER = Path(os.getenv("ICONS_FOLDER", str(HERE / "icons")))
 AUR_HELPER = os.getenv("AUR_HELPER", "auto")
 
@@ -268,9 +269,17 @@ class ArchUpdateIndicator:
         self.install_updates_thread.start()
 
     def _install_updates_handler(self):
-        proc = subprocess.run(self.terminal.split() + ["-e", self.update_cmd], check=False)
+        # Close the terminal on success; keep it open on failure so the error
+        # can be read.
+        script = (
+            f"{self.update_cmd} || {{ rc=$?; echo; "
+            f"printf 'Update failed (exit code %s). Press Enter to close.' $rc; "
+            f"read _; }}"
+        )
+        cmd = shlex.join(["sh", "-c", script])
+        proc = subprocess.run(self.terminal.split() + ["-e", cmd], check=False)
         self.log.debug("Process finished with return code: %s", proc.returncode)
-        self._check_updates()
+        self._check_updates(check_notify=True)
 
 
 def main():
